@@ -1,0 +1,120 @@
+[project]
+name = "cardiovascular-synthetic-generator"
+version = "1.0.0"
+description = "Synthetic cardiovascular data generator using CTGAN with Kafka streaming and Snowflake analytics"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Jorge Eduardo Saavedra"}
+]
+keywords = ["synthetic-data", "ctgan", "kafka", "snowflake", "healthcare", "cardiovascular"]
+
+dependencies = [
+    # FastAPI
+    "fastapi>=0.104.1",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    
+    # Data Processing
+    "pandas>=2.1.3",
+    "numpy>=1.26.2",
+    "scikit-learn>=1.3.2",
+    
+    # Synthetic Data Generation
+    "sdv>=1.8.0",
+    "ctgan>=0.8.0",
+    
+    # Kafka
+    "kafka-python>=2.0.2",
+    "confluent-kafka>=2.3.0",
+    
+    # Snowflake
+    "snowflake-connector-python>=3.5.0",
+    "snowflake-sqlalchemy>=1.5.1",
+    
+    # Environment & Config
+    "python-dotenv>=1.0.0",
+    
+    # Utilities
+    "loguru>=0.7.2",
+    "python-multipart>=0.0.6",
+    
+    # Kaggle
+    "kaggle>=1.6.0",
+    
+    # HTTP Requests
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.3",
+    "pytest-asyncio>=0.21.1",
+    "httpx>=0.25.2",
+    "black>=23.12.0",
+    "ruff>=0.1.8",
+    "mypy>=1.7.1",
+]
+
+[project.scripts]
+api = "app.main:main"
+consumer = "consumer.kafka_consumer:main"
+download-dataset = "scripts.download_dataset:main"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+target-version = ['py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long, handled by black
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+pythonpath = [
+    "."
+]
