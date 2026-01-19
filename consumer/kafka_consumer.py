@@ -32,10 +32,11 @@ class CardiovascularConsumer:
         """Initialize Kafka consumer"""
         try:
             logger.info(f"Connecting to Kafka at {settings.kafka_bootstrap_servers}")
-            logger.info(f"Subscribing to topic: {settings.kafka_topic}")
+            topics = [settings.kafka_topic, settings.kafka_audit_log_topic]
+            logger.info(f"Subscribing to topics: {topics}")
 
             self.consumer = KafkaConsumer(
-                settings.kafka_topic,
+                *topics,
                 bootstrap_servers=settings.kafka_bootstrap_servers.split(","),
                 group_id=settings.kafka_group_id,
                 auto_offset_reset=settings.kafka_auto_offset_reset,
@@ -60,7 +61,8 @@ class CardiovascularConsumer:
         self._connect()
 
         try:
-            batch = []
+            cardiovascular_batch = []
+            audit_batch = []
             batch_size = settings.batch_size
 
             logger.info(f"Listening for messages (batch size: {batch_size})...")
@@ -78,17 +80,23 @@ class CardiovascularConsumer:
                         f"Partition: {message.partition}, Offset: {message.offset}"
                     )
 
-                    # Add to batch
-                    batch.append(data)
-
-                    # Process batch when full
-                    if len(batch) >= batch_size:
-                        self._process_batch(batch)
-                        batch = []
+                    # Route to appropriate batch based on topic
+                    if message.topic == settings.kafka_topic:
+                        cardiovascular_batch.append(data)
+                        # Process batch when full
+                        if len(cardiovascular_batch) >= batch_size:
+                            self._process_batch(cardiovascular_batch, topic_type="cardiovascular")
+                            cardiovascular_batch = []
+                    elif message.topic == settings.kafka_audit_log_topic:
+                        audit_batch.append(data)
+                        # Process batch when full
+                        if len(audit_batch) >= batch_size:
+                            self._process_batch(audit_batch, topic_type="audit")
+                            audit_batch = []
 
                     # Commit offset after successful processing
                     self.consumer.commit()
-                    logger.info(f"Committed offset: {message.offset}")
+                    logger.debug(f"Committed offset: {message.offset}")
 
                 except Exception as e:
                     logger.error(f"Error processing message: {e}")
@@ -96,8 +104,10 @@ class CardiovascularConsumer:
                     # Continue processing other messages
 
             # Process remaining messages
-            if batch:
-                self._process_batch(batch)
+            if cardiovascular_batch:
+                self._process_batch(cardiovascular_batch, topic_type="cardiovascular")
+            if audit_batch:
+                self._process_batch(audit_batch, topic_type="audit")
                 self.consumer.commit()
 
         except KeyboardInterrupt:
@@ -106,18 +116,24 @@ class CardiovascularConsumer:
         finally:
             self._cleanup()
 
-    def _process_batch(self, batch: list):
+    def _process_batch(self, batch: list, topic_type="cardiovascular"):
         """Process a batch of messages and write to Snowflake"""
-        logger.info(f"Processing batch of {len(batch)} messages")
+        logger.info(f"Processing batch of {len(batch)} {topic_type} messages")
 
         try:
-            # Write to Snowflake
-            success = self.snowflake_writer.write_batch(batch)
+            # Write to Snowflake based on topic type
+            if topic_type == "cardiovascular":
+                success = self.snowflake_writer.write_batch(batch)
+            elif topic_type == "audit":
+                success = self.snowflake_writer.write_audit_batch(batch)
+            else:
+                logger.error(f"Unknown topic type: {topic_type}")
+                return
 
             if success:
-                logger.info(f"Successfully wrote {len(batch)} records to Snowflake")
+                logger.info(f"Successfully wrote {len(batch)} {topic_type} records to Snowflake")
             else:
-                logger.error(f"Failed to write batch to Snowflake")
+                logger.error(f"Failed to write {topic_type} batch to Snowflake")
 
         except Exception as e:
             logger.error(f"Error writing batch to Snowflake: {e}")

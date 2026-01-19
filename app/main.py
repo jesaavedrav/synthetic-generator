@@ -25,7 +25,10 @@ from app.models import (
 )
 from app.services.generator_factory import GeneratorFactory, check_model_exists
 from app.services.kafka_producer import KafkaProducerService
-from app.utils import setup_logging, task_tracker
+from app.utils import setup_logging
+from app.services.postgres_task_service import PostgresTaskService
+from app.models.schemas import GenerateWithAnomalyRequest, GenerateWithAnomalyResponse, AnomalyMetadata
+from app.services.anomaly_injector import AnomalyInjectorFactory
 
 # Import all generators to trigger factory registration
 from app.services import (
@@ -35,9 +38,38 @@ from app.services import (
     SMOTEGenerator,
 )
 
-# Setup
+
 settings = get_settings()
 setup_logging()
+
+# Initialize PostgresTaskService singleton
+postgres_task_service = PostgresTaskService()
+
+# Initialize Kafka producers
+kafka_producer = KafkaProducerService()
+
+# Helper for audit logging
+class AuditLogger:
+    @staticmethod
+    def log_event(event_type: str, message: str, data: dict = None, success: bool = True):
+        try:
+            audit_event = {
+                "id": str(uuid.uuid4()),
+                "event_type": event_type,
+                "message": message,
+                "data": data,
+                "success": success,
+                "created_at": datetime.utcnow().isoformat(),
+            }
+            # Create a separate producer for audit logs with the audit-log topic
+            audit_producer = KafkaProducerService()
+            audit_producer.topic = settings.kafka_audit_log_topic
+            audit_producer.send_single(audit_event, key=audit_event["id"])
+            logger.info(f"Audit log sent: {event_type} - {message}")
+        except Exception as e:
+            logger.error(f"Failed to send audit log: {e}")
+
+audit_logger = AuditLogger()
 
 # Initialize FastAPI
 app = FastAPI(
@@ -46,6 +78,92 @@ app = FastAPI(
     description="API for generating synthetic cardiovascular disease data and streaming to Kafka",
 )
 
+
+# --- GENERATE WITH ANOMALY ENDPOINT ---
+@app.post("/generate/anomaly", response_model=GenerateWithAnomalyResponse)
+async def generate_data_with_anomaly(request: GenerateWithAnomalyRequest):
+    """
+    Generate synthetic data and inject anomalies using the specified method/model.
+
+    - **num_samples**: Number of samples to generate
+    - **send_to_kafka**: Whether to send generated data to Kafka
+    - **model_name**: Name of the trained model to use
+    - **method**: Generation method to use
+    - **anomaly**: Specification of anomaly injection (type, columns, params)
+    """
+    try:
+        method_lower = request.method.lower()
+        if not GeneratorFactory.is_method_available(method_lower):
+            available = [m["method"] for m in GeneratorFactory.get_available_methods()]
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid method '{request.method}'. Available: {available}",
+            )
+
+        if not check_model_exists(request.model_name, method_lower):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model '{request.model_name}' with method '{method_lower}' not found. Train it first using /train endpoint.",
+            )
+
+        logger.info(
+            f"Generating {request.num_samples} synthetic samples using {request.model_name} ({method_lower}) with anomaly {request.anomaly.type} on {request.anomaly.columns}"
+        )
+
+        # Generate synthetic data
+        generator = GeneratorFactory.create(method_lower, model_name=request.model_name)
+        synthetic_data = generator.generate(num_samples=request.num_samples)
+
+        # Inject anomaly
+        injector = AnomalyInjectorFactory.get_injector(
+            anomaly_type=request.anomaly.type,
+            columns=request.anomaly.columns,
+            params=request.anomaly.params,
+        )
+        synthetic_data_anom = injector.inject(synthetic_data)
+
+        # Prepare anomaly metadata
+        anomaly_metadata = AnomalyMetadata(
+            applied=True,
+            type=request.anomaly.type,
+            columns=request.anomaly.columns,
+            params=request.anomaly.params or {},
+        )
+
+        sent_to_kafka = False
+        # Prepare records with message_id and metadata
+        records = synthetic_data_anom.to_dict(orient="records")
+        for r in records:
+            r["message_id"] = str(uuid.uuid4())
+            r["generation_metadata"] = {
+                "method": method_lower,
+                "model_name": request.model_name,
+                "anomaly": anomaly_metadata.dict(),
+                "num_samples": request.num_samples,
+            }
+
+        if request.send_to_kafka:
+            kafka_producer.send_batch(records)
+            sent_to_kafka = True
+            logger.info(f"Sent {len(records)} samples with anomaly to Kafka")
+
+        # Return preview (first 10)
+        samples = records
+
+        return GenerateWithAnomalyResponse(
+            status="success",
+            message=f"Generated {len(samples)} synthetic samples with anomaly {request.anomaly.type} using {request.model_name} ({method_lower})",
+            num_samples_generated=len(samples),
+            sent_to_kafka=sent_to_kafka,
+            anomaly_metadata=anomaly_metadata,
+            samples=samples[:10] if len(samples) > 10 else samples,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Generation with anomaly failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 # CORS - Configuración permisiva para desarrollo
 app.add_middleware(
     CORSMiddleware,
@@ -55,6 +173,83 @@ app.add_middleware(
     allow_headers=["*"],  # Permite todos los headers
     expose_headers=["*"],  # Expone todos los headers en la respuesta
 )
+
+# --- AUDIT LOG ENDPOINT ---
+import snowflake.connector
+from app.models.schemas import AuditLogPage, AuditLogEntry
+
+@app.get("/audit-log", response_model=AuditLogPage)
+async def get_audit_log(skip: int = 0, limit: int = 50, event_type: str = None, q: str = None):
+    """Paginated and filtered audit log endpoint."""
+    from config import get_settings
+    settings = get_settings()
+    conn = snowflake.connector.connect(
+        user=settings.snowflake_user,
+        password=settings.snowflake_password,
+        account=settings.snowflake_account,
+        warehouse=settings.snowflake_warehouse,
+        database=settings.snowflake_database,
+        schema=settings.snowflake_schema,
+    )
+    try:
+        import uuid
+        sent_to_kafka = False
+        # Prepare records with message_id and metadata
+        records = synthetic_data_anom.to_dict(orient="records")
+        for r in records:
+            r["message_id"] = str(uuid.uuid4())
+            r["generation_metadata"] = {
+                "method": method_lower,
+                "model_name": request.model_name,
+                "anomaly": anomaly_metadata.dict(),
+                "num_samples": request.num_samples,
+            }
+
+        if request.send_to_kafka:
+            kafka_producer.send_batch(records)
+            sent_to_kafka = True
+            logger.info(f"Sent {len(records)} samples with anomaly to Kafka")
+
+        # Return preview (first 10)
+        samples = records
+
+        return GenerateWithAnomalyResponse(
+            status="success",
+            message=f"Generated {len(samples)} synthetic samples with anomaly {request.anomaly.type} using {request.model_name} ({method_lower})",
+            num_samples_generated=len(samples),
+            sent_to_kafka=sent_to_kafka,
+            anomaly_metadata=anomaly_metadata,
+            samples=samples[:10] if len(samples) > 10 else samples,
+        )
+        with conn.cursor() as cur:
+            cur.execute(count_sql, tuple(params[:-2]))
+            (total,) = cur.fetchone()
+        log_entries = [
+            AuditLogEntry(
+                id=row["ID"],
+                event_type=row["EVENT_TYPE"],
+                message=row["MESSAGE"],
+                data=row["DATA"],
+                success=row["SUCCESS"],
+                created_at=row["CREATED_AT"].isoformat() if row["CREATED_AT"] else None,
+            )
+            for row in rows
+        ]
+        return AuditLogPage(total=total, skip=skip, limit=limit, logs=log_entries)
+        # Crea la tabla AUDIT_LOG si no existe
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS AUDIT_LOG (
+                    ID STRING PRIMARY KEY,
+                    EVENT_TYPE STRING,
+                    MESSAGE STRING,
+                    DATA STRING,
+                    SUCCESS BOOLEAN,
+                    CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+                )
+            """)
+    finally:
+        conn.close()
 
 # Services
 kafka_producer = KafkaProducerService()
@@ -68,11 +263,43 @@ def get_default_generator(model_name: str = "cardiovascular_model", method: str 
     return GeneratorFactory.create(method.lower(), model_name=model_name)
 
 
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup"""
     logger.info("Starting Cardiovascular Synthetic Data Generator API")
+    # Usa la variable global 'settings' para el log
+    global settings
     logger.info(f"API Version: {settings.api_version}")
+
+    # Ensure TRAINING_TASKS table exists in Snowflake
+    import snowflake.connector
+    from config import get_settings
+    local_settings = get_settings()
+    conn = snowflake.connector.connect(
+        user=local_settings.snowflake_user,
+        password=local_settings.snowflake_password,
+        account=local_settings.snowflake_account,
+        warehouse=local_settings.snowflake_warehouse,
+        database=local_settings.snowflake_database,
+        schema=local_settings.snowflake_schema,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS TRAINING_TASKS (
+                    TASK_ID STRING PRIMARY KEY,
+                    TYPE STRING,
+                    STATUS STRING,
+                    REQUEST_DATA STRING,
+                    PROGRESS INTEGER,
+                    ERROR STRING,
+                    CREATED_AT TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+                    UPDATED_AT TIMESTAMP_LTZ
+                )
+            """)
+    finally:
+        conn.close()
 
 
 @app.on_event("shutdown")
@@ -249,8 +476,29 @@ async def train_model(request: TrainingRequest, background_tasks: BackgroundTask
             f"Creating training task {task_id} with {request.epochs} epochs using {method_lower}"
         )
 
-        # Create task in tracker
-        task = task_tracker.create_task(task_id=task_id, request_data=request.dict())
+        # Crea el task en Postgres
+        postgres_task_service.create_task(
+            task_id=task_id,
+            type_="training",
+            status="pending",
+            request_data=request.dict(),
+            progress=0,
+            error=None,
+        )
+
+        # Send audit log
+        audit_logger.log_event(
+            event_type="training_started",
+            message=f"Training task {task_id} initiated with method {method_lower}",
+            data={
+                "task_id": task_id,
+                "method": method_lower,
+                "model_name": request.model_name,
+                "epochs": request.epochs,
+                "dataset_path": request.dataset_path,
+            },
+            success=True,
+        )
 
         # Start training in background
         background_tasks.add_task(train_model_task, task_id=task_id, request=request)
@@ -275,12 +523,19 @@ async def get_training_status(task_id: str):
 
     - **task_id**: The task ID returned from POST /train
     """
-    task = task_tracker.get_task(task_id)
-
+    task = postgres_task_service.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-
-    return TrainingStatusResponse(**task.to_dict())
+    return TrainingStatusResponse(
+        task_id=task["TASK_ID"],
+        status=task["STATUS"],
+        message="Training task status",
+        progress=task.get("PROGRESS"),
+        started_at=task.get("CREATED_AT").isoformat() if task.get("CREATED_AT") else None,
+        completed_at=task.get("UPDATED_AT").isoformat() if task.get("UPDATED_AT") else None,
+        error=task.get("ERROR"),
+        result=None,
+    )
 
 
 @app.get("/train/tasks")
@@ -288,22 +543,36 @@ async def list_training_tasks():
     """
     List all training tasks
     """
-    tasks = task_tracker.list_tasks()
-    return {"total": len(tasks), "tasks": [task.to_dict() for task in tasks.values()]}
+    total = postgres_task_service.count_tasks()
+    tasks = postgres_task_service.list_tasks()
+    return {
+        "total": total,
+        "tasks": [
+            {
+                "task_id": t.task_id,
+                "status": t.status,
+                "progress": t.progress,
+                "error": t.error,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+                "request_data": t.request_data,
+            }
+            for t in tasks
+        ],
+    }
 
 
 async def train_model_task(task_id: str, request: TrainingRequest):
     """Background task to train the model"""
     import asyncio
 
-    task = task_tracker.get_task(task_id)
+    task = postgres_task_service.get_task(task_id)
     if not task:
         logger.error(f"Task {task_id} not found in tracker")
         return
 
     try:
         # Mark as started
-        task.start()
+        postgres_task_service.update_task(task_id, status="running")
         logger.info(f"Task {task_id}: Starting training with method {request.method}")
 
         dataset_path = request.dataset_path or settings.dataset_path
@@ -312,6 +581,9 @@ async def train_model_task(task_id: str, request: TrainingRequest):
         generator = GeneratorFactory.create(request.method.lower(), model_name=request.model_name)
 
         # Training happens in executor to not block event loop
+        def progress_callback(pct):
+            postgres_task_service.update_task(task_id, progress=int(pct))
+
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
@@ -320,23 +592,52 @@ async def train_model_task(task_id: str, request: TrainingRequest):
                 model_name=request.model_name,
                 epochs=request.epochs,
                 batch_size=request.batch_size,
-                progress_callback=lambda p: task.update_progress(p),
+                progress_callback=progress_callback,
             ),
         )
 
         # Mark as completed
-        task.complete(result)
+        postgres_task_service.update_task(task_id, status="completed", progress=100)
         logger.info(f"Task {task_id}: Training completed successfully")
+        
+        # Send audit log
+        audit_logger.log_event(
+            event_type="training_completed",
+            message=f"Training task {task_id} completed successfully",
+            data={
+                "task_id": task_id,
+                "method": request.method.lower(),
+                "model_name": request.model_name,
+                "epochs": request.epochs,
+            },
+            success=True,
+        )
 
     except FileNotFoundError as e:
         error_msg = f"Dataset not found: {e}"
         logger.error(f"Task {task_id}: {error_msg}")
-        task.fail(error_msg)
+        postgres_task_service.update_task(task_id, status="failed", error=error_msg)
+        
+        # Send audit log
+        audit_logger.log_event(
+            event_type="training_failed",
+            message=f"Training task {task_id} failed: {error_msg}",
+            data={"task_id": task_id, "error": error_msg},
+            success=False,
+        )
 
     except Exception as e:
         error_msg = f"Training failed: {e}"
         logger.error(f"Task {task_id}: {error_msg}")
-        task.fail(error_msg)
+        postgres_task_service.update_task(task_id, status="failed", error=error_msg)
+        
+        # Send audit log
+        audit_logger.log_event(
+            event_type="training_failed",
+            message=f"Training task {task_id} failed: {error_msg}",
+            data={"task_id": task_id, "error": error_msg},
+            success=False,
+        )
 
 
 @app.post("/generate", response_model=GenerateResponse)
@@ -372,16 +673,43 @@ async def generate_data(request: GenerateRequest):
 
         # Create generator for the specified model and method
         generator = GeneratorFactory.create(method_lower, model_name=request.model_name)
+
         synthetic_data = generator.generate(num_samples=request.num_samples)
+        import pandas as pd
+        import uuid
+        # Defensive: ensure DataFrame
+        if isinstance(synthetic_data, list):
+            synthetic_data = pd.DataFrame(synthetic_data)
+        if not isinstance(synthetic_data, pd.DataFrame):
+            raise HTTPException(status_code=500, detail="Generator did not return a DataFrame.")
+        # Prepare records with message_id and metadata
+        records = synthetic_data.to_dict(orient="records")
+        for r in records:
+            r["message_id"] = str(uuid.uuid4())
+            r["generation_metadata"] = {
+                "method": method_lower,
+                "model_name": request.model_name,
+                "num_samples": request.num_samples,
+            }
 
         sent_to_kafka = False
         if request.send_to_kafka:
-            kafka_producer.send_batch(synthetic_data)
+            kafka_producer.send_batch(records)
             sent_to_kafka = True
-            logger.info(f"Sent {len(synthetic_data)} samples to Kafka")
+            logger.info(f"Sent {len(records)} samples to Kafka")
+            # Send audit log
+            audit_logger.log_event(
+                event_type="data_generated",
+                message=f"Generated and sent {len(records)} samples to Kafka",
+                data={
+                    "num_samples": len(records),
+                    "model_name": request.model_name,
+                    "method": method_lower,
+                },
+                success=True,
+            )
 
-        # Convert to list of dicts for response
-        samples = synthetic_data.to_dict(orient="records")
+        samples = records
 
         return GenerateResponse(
             status="success",
@@ -506,6 +834,71 @@ async def stream_to_kafka_task(
 
     except Exception as e:
         logger.error(f"Task {task_id}: Streaming failed - {e}")
+
+# --- ADMIN: TRUNCATE TABLE ---
+from fastapi import Query
+
+VALID_TABLES = ["TRAINING_TASKS", "AUDIT_LOG"]
+
+@app.post("/admin/truncate-table")
+async def truncate_table(table: str = Query(..., description=f"Nombre de la tabla a truncar. Opciones: {', '.join(VALID_TABLES)}")):
+    """
+    Trunca una tabla específica en Snowflake.
+    Nombres válidos: TRAINING_TASKS, AUDIT_LOG
+    """
+    table_upper = table.upper()
+    if table_upper not in VALID_TABLES:
+        return {"status": "error", "message": f"Nombre de tabla inválido. Usa uno de: {', '.join(VALID_TABLES)}"}
+    import snowflake.connector
+    from config import get_settings
+    settings = get_settings()
+    conn = snowflake.connector.connect(
+        user=settings.snowflake_user,
+        password=settings.snowflake_password,
+        account=settings.snowflake_account,
+        warehouse=settings.snowflake_warehouse,
+        database=settings.snowflake_database,
+        schema=settings.snowflake_schema,
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE TABLE IF EXISTS {table_upper}")
+        return {"status": "success", "message": f"Tabla {table_upper} truncada"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    finally:
+        conn.close()
+
+# --- Admin Endpoints ---
+@app.post("/admin/truncate-postgres-table", tags=["Admin"])
+async def truncate_postgres_table(table_name: str):
+    """
+    Truncate a table in the PostgreSQL database.
+    USE WITH CAUTION. This will delete all data in the table.
+    """
+    try:
+        logger.warning(f"Attempting to truncate PostgreSQL table: {table_name}")
+        postgres_task_service.truncate_table(table_name)
+        message = f"Successfully truncated table '{table_name}' in PostgreSQL."
+        logger.info(message)
+        return {"message": message}
+    except ValueError as e:
+        logger.error(f"Error truncating table: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred.")
+
+@app.get("/admin/postgres-tables", tags=["Admin"], response_model=list[str])
+async def get_postgres_tables():
+    """
+    Get a list of all table names in the PostgreSQL database that can be truncated.
+    """
+    try:
+        return postgres_task_service.get_table_names()
+    except Exception as e:
+        logger.error(f"An unexpected error occurred while fetching postgres tables: {e}")
+        raise HTTPException(status_code=500, detail="An internal server error occurred.")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,70 @@
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
+
+# --- Audit Log Schemas ---
+class AuditLogEntry(BaseModel):
+    id: int
+    event_type: str
+    message: str
+    data: Optional[Dict[str, Any]] = None
+    success: bool
+    created_at: str
+
+class AuditLogPage(BaseModel):
+    total: int
+    skip: int
+    limit: int
+    logs: List[AuditLogEntry]
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, List, Union
 from datetime import datetime
+class AnomalySpec(BaseModel):
+    """Specification for anomaly injection"""
+    type: str = Field(..., description="Type of anomaly: outlier, missing, category_noise, etc.")
+    columns: Optional[List[str]] = Field(None, description="Target columns for anomaly injection")
+    params: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Parameters for the anomaly injector")
+
+
+class GenerateWithAnomalyRequest(BaseModel):
+    """Request model for generating synthetic data with anomaly injection"""
+    num_samples: int = Field(default=10, ge=1, le=10000)
+    send_to_kafka: bool = Field(default=False)
+    model_name: str = Field(default="cardiovascular_model", description="Name of the trained model to use")
+    method: str = Field(default="ctgan", description="Generation method: ctgan, tvae, or gaussian_copula")
+    anomaly: AnomalySpec = Field(..., description="Anomaly injection specification")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "num_samples": 100,
+                "send_to_kafka": True,
+                "model_name": "cardiovascular_model",
+                "method": "ctgan",
+                "anomaly": {
+                    "type": "outlier",
+                    "columns": ["BMI"],
+                    "params": {"factor": 4, "proportion": 0.02}
+                }
+            }
+        }
+
+
+class AnomalyMetadata(BaseModel):
+    """Metadata about the anomaly injected in the sample"""
+    applied: bool = Field(..., description="Whether anomaly was injected")
+    type: Optional[str] = Field(None, description="Type of anomaly")
+    columns: Optional[List[str]] = Field(None, description="Columns affected")
+    params: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Parameters used for anomaly injection")
+
+
+class GenerateWithAnomalyResponse(BaseModel):
+    """Response model for data generation with anomaly injection"""
+    status: str
+    message: str
+    num_samples_generated: int
+    sent_to_kafka: bool
+    anomaly_metadata: AnomalyMetadata
+    samples: Optional[List[Dict[str, Any]]] = None
 
 
 class HealthResponse(BaseModel):

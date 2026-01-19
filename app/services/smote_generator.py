@@ -84,6 +84,10 @@ class SMOTEGenerator(BaseSyntheticGenerator):
         logger.info("Preparing label encoders for categorical columns...")
         start_time = time.time()
 
+        # Reset categorical columns and encoders to avoid duplicates
+        self.categorical_columns = []
+        self.label_encoders = {}
+
         for col in df.columns:
             if df[col].dtype == "object" or df[col].dtype.name == "category":
                 self.categorical_columns.append(col)
@@ -166,24 +170,9 @@ class SMOTEGenerator(BaseSyntheticGenerator):
 
         # Encode categorical columns using the stored encoders
         for col in self.categorical_columns:
-            # Handle unknown labels by using fit_transform instead of transform
             if col in df.columns:
-                # For categorical columns, ensure we handle any new values
                 df[col] = df[col].astype(str)
-                # Get unique values
-                unique_vals = df[col].unique()
-                # Check if encoder knows all values
-                known_vals = set(self.label_encoders[col].classes_)
-                unknown_vals = set(unique_vals) - known_vals
-                
-                if unknown_vals:
-                    logger.warning(
-                        f"Column '{col}' has unknown values: {unknown_vals}. "
-                        f"Re-fitting encoder."
-                    )
-                    # Re-fit the encoder with all values
-                    self.label_encoders[col].fit(df[col])
-                
+                # Simply transform using existing encoder (no re-fitting needed for original data)
                 df[col] = self.label_encoders[col].transform(df[col])
 
         # Separate features and target
@@ -200,14 +189,16 @@ class SMOTEGenerator(BaseSyntheticGenerator):
             logger.error(f"SMOTE fit_resample failed: {e}")
             raise ValueError(f"SMOTE generation failed: {e}")
 
-        # Combine features and target
-        df_resampled = X_resampled.copy()
+        # Convert back to DataFrame with proper column names
+        df_resampled = pd.DataFrame(X_resampled, columns=X.columns)
         df_resampled[self.target_column] = y_resampled
 
         # Decode categorical columns back to original values
         for col in self.categorical_columns:
             if col in df_resampled.columns:
-                # Ensure values are integers before inverse transform
+                # Ensure the column is numeric (float from SMOTE) before processing
+                df_resampled[col] = pd.to_numeric(df_resampled[col], errors='coerce')
+                # Round to integers
                 df_resampled[col] = df_resampled[col].round().astype(int)
                 # Clip values to valid range for the encoder
                 min_val = 0

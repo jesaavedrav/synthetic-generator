@@ -79,22 +79,32 @@ class KafkaProducerService:
             logger.error(f"Unexpected error sending message: {e}")
             return False
 
-    def send_batch(self, df: pd.DataFrame) -> Dict[str, Any]:
+    def send_batch(self, data) -> Dict[str, Any]:
         """
         Send a batch of records to Kafka
 
         Args:
-            df: DataFrame with synthetic data
+            data: DataFrame or list of dicts with synthetic data
 
         Returns:
             Dictionary with send statistics
         """
+        import pandas as pd
         if self.producer is None:
             self._connect()
 
         if self.producer is None:
             logger.error("Cannot send batch: Kafka producer not available")
-            return {"success": False, "sent": 0, "failed": 0, "total": len(df)}
+            return {"success": False, "sent": 0, "failed": 0, "total": 0}
+
+        # Accept DataFrame or list of dicts
+        if isinstance(data, list):
+            df = pd.DataFrame(data)
+        else:
+            df = data
+        if not isinstance(df, pd.DataFrame):
+            logger.error("send_batch: Input is not a DataFrame or list of dicts")
+            return {"success": False, "sent": 0, "failed": 0, "total": 0}
 
         sent = 0
         failed = 0

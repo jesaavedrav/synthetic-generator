@@ -94,12 +94,13 @@ generate:
 
 # Local Development Commands
 run-infra:
-	@echo "Starting Kafka infrastructure (Docker)..."
-	docker-compose up -d kafka zookeeper kafka-ui
+	@echo "Starting Kafka & Postgres infrastructure (Docker)..."
+	docker-compose up -d kafka zookeeper kafka-ui postgres
 	@echo ""
-	@echo "Kafka infrastructure started!"
+	@echo "Infrastructure started!"
 	@echo "Kafka: localhost:9092"
 	@echo "Kafka UI: http://localhost:8080"
+	@echo "Postgres: localhost:5433"
 
 run-api:
 	@echo "Starting API locally..."

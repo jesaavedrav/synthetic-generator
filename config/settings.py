@@ -5,6 +5,13 @@ from functools import lru_cache
 class Settings(BaseSettings):
     """Application settings loaded from environment variables"""
 
+    # Postgres Configuration
+    postgres_host: str = "localhost"
+    postgres_port: int = 5433
+    postgres_user: str = "postgres"
+    postgres_password: str = "postgres"
+    postgres_db: str = "synthetic_generator"
+
     # API Configuration
     api_host: str = "0.0.0.0"
     api_port: int = 8000
@@ -16,6 +23,9 @@ class Settings(BaseSettings):
     kafka_topic: str = "cardiovascular-data"
     kafka_group_id: str = "cardiovascular-consumer-group"
     kafka_auto_offset_reset: str = "earliest"
+
+    # Audit log topic
+    kafka_audit_log_topic: str = "audit-log"
 
     # Snowflake Configuration
     snowflake_account: str
@@ -29,7 +39,7 @@ class Settings(BaseSettings):
     # Data Generation
     dataset_path: str = "./data/cardiovascular_data.csv"
     model_path: str = "./models/cardiovascular_model.pkl"
-    batch_size: int = 100
+    batch_size: int = 10
     generation_interval: int = 5
 
     # Logging

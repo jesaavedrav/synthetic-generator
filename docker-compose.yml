@@ -17,6 +17,7 @@ services:
     networks:
       - cardiovascular-network
 
+
   # Kafka Broker
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -56,7 +57,7 @@ services:
     depends_on:
       - kafka
     ports:
-      - "8080:8080"
+      - "8081:8080"
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
@@ -64,59 +65,74 @@ services:
     networks:
       - cardiovascular-network
 
-  # FastAPI Producer Service
-  api-producer:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    container_name: cardiovascular-api
-    depends_on:
-      kafka:
-        condition: service_healthy
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: synthetic_generator
     ports:
-      - "8000:8000"
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      - KAFKA_TOPIC=cardiovascular-data
-      - API_HOST=0.0.0.0
-      - API_PORT=8000
-    env_file:
-      - .env
+      - "5433:5432"
     volumes:
-      - ./data:/app/data
-      - ./models:/app/models
-      - ./logs:/app/logs
+      - postgres_data:/var/lib/postgresql/data
     networks:
       - cardiovascular-network
-    restart: unless-stopped
 
-  # Kafka Consumer Service (writes to Snowflake)
-  consumer:
-    build:
-      context: .
-      dockerfile: Dockerfile.consumer
-    container_name: cardiovascular-consumer
-    depends_on:
-      kafka:
-        condition: service_healthy
-      api-producer:
-        condition: service_started
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
-      - KAFKA_TOPIC=cardiovascular-data
-      - KAFKA_GROUP_ID=cardiovascular-consumer-group
-    env_file:
-      - .env
-    volumes:
-      - ./logs:/app/logs
-    networks:
-      - cardiovascular-network
-    restart: unless-stopped
+  # # FastAPI Producer Service
+  # api-producer:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.api
+  #   container_name: cardiovascular-api
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+  #     - KAFKA_TOPIC=cardiovascular-data
+  #     - API_HOST=0.0.0.0
+  #     - API_PORT=8000
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./models:/app/models
+  #     - ./logs:/app/logs
+  #   networks:
+  #     - cardiovascular-network
+  #   restart: unless-stopped
+
+  # # Kafka Consumer Service (writes to Snowflake)
+  # consumer:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.consumer
+  #   container_name: cardiovascular-consumer
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #     api-producer:
+  #       condition: service_started
+  #   environment:
+  #     - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+  #     - KAFKA_TOPIC=cardiovascular-data
+  #     - KAFKA_GROUP_ID=cardiovascular-consumer-group
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./logs:/app/logs
+  #   networks:
+  #     - cardiovascular-network
+  #   restart: unless-stopped
 
 volumes:
   zookeeper-data:
   zookeeper-logs:
   kafka-data:
+  postgres_data:
 
 networks:
   cardiovascular-network:
